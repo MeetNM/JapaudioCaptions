@@ -26,6 +26,7 @@ class MainActivity : AppCompatActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var recognizer: SpeechRecognizer? = null
     private var wantListening = false
+    
     private var partialSeq = 0
 
     private val translator = Translation.getClient(
