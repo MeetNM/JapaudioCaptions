@@ -225,6 +225,7 @@ class CaptionService : Service() {
                 val n = ar.read(buf, 0, buf.size)
                 if (n < 0) break
                 if (n == 0) continue
+                boost(buf, n)
                 if (rec.acceptWaveForm(buf, n)) {
                     val t = clean(JSONObject(rec.result).optString("text"))
                     if (t.isNotEmpty()) onFinal(t)
@@ -266,7 +267,33 @@ class CaptionService : Service() {
             .build()
         return if (ar.state == AudioRecord.STATE_INITIALIZED) ar else { ar.release(); null }
     }
+    private var agcGain = 1f
 
+// Amplify quiet speech (whispers) before recognition; ignores near-silence.
+private fun boost(buf: ByteArray, n: Int) {
+    var peak = 1
+    var i = 0
+    while (i + 1 < n) {
+        val s = ((buf[i + 1].toInt() shl 8) or (buf[i].toInt() and 0xFF)).toShort().toInt()
+        val a = if (s < 0) -s else s
+        if (a > peak) peak = a
+        i += 2
+    }
+    if (peak >= 250) {
+        val target = (20000f / peak).coerceIn(1f, 8f)
+        agcGain += (target - agcGain) * 0.3f
+    }
+    if (agcGain < 1.05f) return
+    i = 0
+    while (i + 1 < n) {
+        val s = ((buf[i + 1].toInt() shl 8) or (buf[i].toInt() and 0xFF)).toShort().toInt()
+        val v = (s * agcGain).toInt().coerceIn(-32768, 32767)
+        buf[i] = (v and 0xFF).toByte()
+        buf[i + 1] = ((v shr 8) and 0xFF).toByte()
+        i += 2
+    }
+}
+    
     // Vosk's Japanese model puts spaces between words; remove them.
     private fun clean(s: String) = s.replace(" ", "").replace("\u3000", "").trim()
 
