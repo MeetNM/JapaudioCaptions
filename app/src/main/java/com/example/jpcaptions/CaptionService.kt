@@ -23,6 +23,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -134,46 +135,80 @@ class CaptionService : Service() {
     private fun showOverlay() {
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         val dp = resources.displayMetrics.density
+        val prefs = getSharedPreferences("jp", MODE_PRIVATE)
+        var textSp = prefs.getFloat("capsize", 22f)
+        var showJp = prefs.getBoolean("showjp", true)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding((14 * dp).toInt(), (6 * dp).toInt(), (14 * dp).toInt(), (10 * dp).toInt())
+            minimumHeight = (110 * dp).toInt()
+            setPadding((14 * dp).toInt(), (4 * dp).toInt(), (14 * dp).toInt(), (12 * dp).toInt())
             background = GradientDrawable().apply {
-                setColor(0xCC000000.toInt())
+                setColor(0xD9000000.toInt())
                 cornerRadius = 16 * dp
             }
         }
-        val stop = TextView(this).apply {
-            text = "✕ Stop"
-            setTextColor(0xFFFF8A80.toInt())
-            textSize = 13f
-            gravity = Gravity.END
-            setPadding(0, (4 * dp).toInt(), 0, (4 * dp).toInt())
-            setOnClickListener { stopSelf() }
-        }
         val jp = TextView(this).apply {
             setTextColor(0xFFBBBBBB.toInt())
-            textSize = 13f
             text = "Loading Whisper model…"
         }
         val en = TextView(this).apply {
             setTextColor(Color.WHITE)
-            textSize = 20f
         }
-        root.addView(stop, LinearLayout.LayoutParams(
+
+        fun applySizes() {
+            en.textSize = textSp
+            jp.textSize = (textSp * 0.65f).coerceAtLeast(11f)
+            jp.visibility = if (showJp) View.VISIBLE else View.GONE
+        }
+        applySizes()
+
+        fun chip(label: String, color: Int, onClick: () -> Unit): TextView =
+            TextView(this).apply {
+                text = label
+                setTextColor(color)
+                textSize = 15f
+                setPadding((12 * dp).toInt(), (8 * dp).toInt(), (12 * dp).toInt(), (8 * dp).toInt())
+                setOnClickListener { onClick() }
+            }
+
+        val top = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+        }
+        top.addView(chip("A−", Color.WHITE) {
+            textSp = (textSp - 2f).coerceAtLeast(12f)
+            prefs.edit().putFloat("capsize", textSp).apply()
+            applySizes()
+        })
+        top.addView(chip("A+", Color.WHITE) {
+            textSp = (textSp + 2f).coerceAtMost(44f)
+            prefs.edit().putFloat("capsize", textSp).apply()
+            applySizes()
+        })
+        top.addView(chip("JP", 0xFF9CCBFF.toInt()) {
+            showJp = !showJp
+            prefs.edit().putBoolean("showjp", showJp).apply()
+            applySizes()
+        })
+        top.addView(chip("✕ Stop", 0xFFFF8A80.toInt()) { stopSelf() })
+
+        root.addView(top, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         root.addView(jp)
         root.addView(en)
 
+        // Full width (minus a small margin) so it also fits when the phone is rotated.
         val lp = WindowManager.LayoutParams(
-            (resources.displayMetrics.widthPixels * 0.94).toInt(),
+            WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            y = (90 * dp).toInt()
+            horizontalMargin = 0.03f
+            y = (60 * dp).toInt()
         }
 
         var lastY = 0f
