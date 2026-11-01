@@ -21,7 +21,6 @@ import android.media.projection.MediaProjectionManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.os.SystemClock
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.WindowManager
@@ -32,10 +31,16 @@ import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
-import org.json.JSONObject
-import org.vosk.Model
-import org.vosk.Recognizer
+import com.k2fsa.sherpa.onnx.FeatureConfig
+import com.k2fsa.sherpa.onnx.OfflineModelConfig
+import com.k2fsa.sherpa.onnx.OfflineRecognizer
+import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
+import com.k2fsa.sherpa.onnx.OfflineWhisperModelConfig
+import com.k2fsa.sherpa.onnx.SileroVadModelConfig
+import com.k2fsa.sherpa.onnx.Vad
+import com.k2fsa.sherpa.onnx.VadModelConfig
 import java.io.File
+import java.util.concurrent.LinkedBlockingQueue
 
 class CaptionService : Service() {
 
@@ -43,6 +48,7 @@ class CaptionService : Service() {
         const val ACTION_STOP = "com.example.jpcaptions.STOP"
         private const val CHANNEL_ID = "captions"
         private const val SAMPLE_RATE = 16000
+        private val STOP = FloatArray(0)
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -56,8 +62,7 @@ class CaptionService : Service() {
     private var worker: Thread? = null
 
     @Volatile private var seq = 0
-    private var lastPartial = ""
-    private var lastPartialAt = 0L
+    private var agcGain = 1f
 
     private val clearRunnable = Runnable {
         jpText?.text = ""
@@ -149,7 +154,7 @@ class CaptionService : Service() {
         val jp = TextView(this).apply {
             setTextColor(0xFFBBBBBB.toInt())
             textSize = 13f
-            text = "Loading speech model…"
+            text = "Loading Whisper model…"
         }
         val en = TextView(this).apply {
             setTextColor(Color.WHITE)
@@ -196,11 +201,13 @@ class CaptionService : Service() {
 
     private fun ui(block: () -> Unit) { main.post { block() } }
 
-    // ---------- audio -> text -> English ----------
+    // ---------- audio -> speech detection -> Whisper -> English ----------
     private fun runPipeline() {
-        var model: Model? = null
-        var rec: Recognizer? = null
+        var vad: Vad? = null
+        var rec: OfflineRecognizer? = null
         var record: AudioRecord? = null
+        var decodeThread: Thread? = null
+        val queue = LinkedBlockingQueue<FloatArray>()
         try {
             translator = Translation.getClient(
                 TranslatorOptions.Builder()
@@ -208,8 +215,51 @@ class CaptionService : Service() {
                     .setTargetLanguage(TranslateLanguage.ENGLISH)
                     .build()
             )
-            model = Model(File(filesDir, "model-ja").absolutePath)
-            rec = Recognizer(model, SAMPLE_RATE.toFloat())
+
+            val sel = getSharedPreferences("jp", MODE_PRIVATE).getString("sel", "small") ?: "small"
+            val dir = File(filesDir, "whisper-$sel")
+            val whisper = OfflineWhisperModelConfig(
+                encoder = File(dir, "encoder.int8.onnx").absolutePath,
+                decoder = File(dir, "decoder.int8.onnx").absolutePath,
+                language = "ja",
+                task = "transcribe",
+                tailPaddings = 1000
+            )
+            val modelCfg = OfflineModelConfig(
+                whisper = whisper,
+                tokens = File(dir, "tokens.txt").absolutePath,
+                numThreads = 4,
+                debug = false,
+                provider = "cpu",
+                modelType = "whisper"
+            )
+            val recCfg = OfflineRecognizerConfig(
+                featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = 80),
+                modelConfig = modelCfg,
+                decodingMethod = "greedy_search"
+            )
+            val r = OfflineRecognizer(null, recCfg)
+            rec = r
+
+            // Sensitive settings so quiet speech and whispers are still picked up.
+            val vadCfg = VadModelConfig(
+                sileroVadModelConfig = SileroVadModelConfig(
+                    model = File(filesDir, "silero_vad.onnx").absolutePath,
+                    threshold = 0.35f,
+                    minSilenceDuration = 0.45f,
+                    minSpeechDuration = 0.2f,
+                    windowSize = 512,
+                    maxSpeechDuration = 8f
+                ),
+                sampleRate = SAMPLE_RATE,
+                numThreads = 1,
+                provider = "cpu",
+                debug = false
+            )
+            val v = Vad(null, vadCfg)
+            vad = v
+
+            decodeThread = Thread { decodeLoop(r, queue) }.also { it.start() }
 
             val ar = buildRecord()
             if (ar == null) {
@@ -221,26 +271,61 @@ class CaptionService : Service() {
             ui { jpText?.text = ""; enText?.text = "Listening to system audio…" }
 
             val buf = ByteArray(3200) // ~100 ms
+            var speaking = false
             while (running) {
                 val n = ar.read(buf, 0, buf.size)
                 if (n < 0) break
                 if (n == 0) continue
-                boost(buf, n)
-                if (rec.acceptWaveForm(buf, n)) {
-                    val t = clean(JSONObject(rec.result).optString("text"))
-                    if (t.isNotEmpty()) onFinal(t)
-                } else {
-                    val p = clean(JSONObject(rec.partialResult).optString("partial"))
-                    if (p.isNotEmpty()) onPartial(p)
+                v.acceptWaveform(pcmToFloat(buf, n))
+
+                val sp = v.isSpeechDetected()
+                if (sp && !speaking) {
+                    ui { if (jpText?.text.isNullOrEmpty()) jpText?.text = "…" }
+                }
+                speaking = sp
+
+                while (!v.empty()) {
+                    val seg = v.front()
+                    v.pop()
+                    queue.offer(seg.samples)
                 }
             }
         } catch (e: Throwable) {
             showError("Error: ${e.message}")
         } finally {
+            queue.clear()
+            queue.offer(STOP)
+            try { decodeThread?.join() } catch (_: InterruptedException) {}
             try { record?.stop() } catch (_: Exception) {}
             record?.release()
-            rec?.close()
-            model?.close()
+            vad?.release()
+            rec?.release()
+        }
+    }
+
+    // Runs Whisper on finished speech segments. If the phone falls behind, old segments are skipped.
+    private fun decodeLoop(r: OfflineRecognizer, queue: LinkedBlockingQueue<FloatArray>) {
+        try {
+            while (true) {
+                var seg = queue.take()
+                if (seg === STOP) return
+                while (queue.size > 2) {
+                    val next = queue.poll() ?: break
+                    if (next === STOP) return
+                    seg = next
+                }
+                val stream = r.createStream()
+                try {
+                    stream.acceptWaveform(seg, SAMPLE_RATE)
+                    r.decode(stream)
+                    val text = r.getResult(stream).text.trim()
+                    if (text.any { it.isLetterOrDigit() }) onFinal(text)
+                } finally {
+                    stream.release()
+                }
+            }
+        } catch (e: Throwable) {
+            showError("Error: ${e.message}")
         }
     }
 
@@ -267,61 +352,40 @@ class CaptionService : Service() {
             .build()
         return if (ar.state == AudioRecord.STATE_INITIALIZED) ar else { ar.release(); null }
     }
-    private var agcGain = 1f
 
-// Amplify quiet speech (whispers) before recognition; ignores near-silence.
-private fun boost(buf: ByteArray, n: Int) {
-    var peak = 1
-    var i = 0
-    while (i + 1 < n) {
-        val s = ((buf[i + 1].toInt() shl 8) or (buf[i].toInt() and 0xFF)).toShort().toInt()
-        val a = if (s < 0) -s else s
-        if (a > peak) peak = a
-        i += 2
-    }
-    if (peak >= 250) {
-        val target = (20000f / peak).coerceIn(1f, 8f)
-        agcGain += (target - agcGain) * 0.3f
-    }
-    if (agcGain < 1.05f) return
-    i = 0
-    while (i + 1 < n) {
-        val s = ((buf[i + 1].toInt() shl 8) or (buf[i].toInt() and 0xFF)).toShort().toInt()
-        val v = (s * agcGain).toInt().coerceIn(-32768, 32767)
-        buf[i] = (v and 0xFF).toByte()
-        buf[i + 1] = ((v shr 8) and 0xFF).toByte()
-        i += 2
-    }
-}
-    
-    // Vosk's Japanese model puts spaces between words; remove them.
-    private fun clean(s: String) = s.replace(" ", "").replace("\u3000", "").trim()
-
-    private fun onPartial(t: String) {
-        val now = SystemClock.uptimeMillis()
-        if (t == lastPartial || now - lastPartialAt < 400) return
-        lastPartial = t
-        lastPartialAt = now
-        val my = ++seq
-        ui {
-            main.removeCallbacks(clearRunnable)
-            jpText?.text = t
+    // Converts 16-bit audio to floats and boosts quiet speech (whispers); near-silence is not boosted.
+    private fun pcmToFloat(buf: ByteArray, n: Int): FloatArray {
+        val count = n / 2
+        val out = FloatArray(count)
+        var peak = 1
+        for (i in 0 until count) {
+            val s = ((buf[2 * i + 1].toInt() shl 8) or (buf[2 * i].toInt() and 0xFF)).toShort().toInt()
+            out[i] = s.toFloat()
+            val a = if (s < 0) -s else s
+            if (a > peak) peak = a
         }
-        translate(t) { en -> if (my == seq) enText?.text = en }
+        if (peak >= 250) {
+            val target = (20000f / peak).coerceIn(1f, 8f)
+            agcGain = if (target < agcGain) target else agcGain + (target - agcGain) * 0.05f
+        }
+        for (i in 0 until count) {
+            out[i] = (out[i] * agcGain).coerceIn(-32768f, 32767f) / 32768f
+        }
+        return out
     }
 
     private fun onFinal(t: String) {
-        lastPartial = ""
         val my = ++seq
         ui {
             main.removeCallbacks(clearRunnable)
             jpText?.text = t
+            enText?.text = ""
         }
         translate(t) { en ->
             if (my == seq) {
                 enText?.text = en
                 main.removeCallbacks(clearRunnable)
-                main.postDelayed(clearRunnable, 6000)
+                main.postDelayed(clearRunnable, 8000)
             }
         }
     }
