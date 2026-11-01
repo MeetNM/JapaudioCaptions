@@ -11,6 +11,11 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+      - name: Download speech library (sherpa-onnx)
+        run: |
+          mkdir -p app/libs
+          curl -L --fail -o app/libs/sherpa-onnx-2.0.1.aar https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-2.0.1.aar
+          ls -la app/libs
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
