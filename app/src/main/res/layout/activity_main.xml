@@ -21,7 +21,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="Captions the audio playing on your phone (any app or browser) and shows English subtitles on top of other apps."
+            android:text="Captions the audio playing on your phone (any app or browser) using Whisper AI and shows English subtitles on top of other apps."
             android:textSize="14sp" />
 
         <TextView
@@ -32,11 +32,31 @@
             android:textSize="14sp"
             android:textStyle="italic" />
 
+        <RadioGroup
+            android:id="@+id/modelGroup"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:orientation="vertical">
+
+            <RadioButton
+                android:id="@+id/radioSmall"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Accurate: Whisper small (about 375 MB). Best for quiet speech." />
+
+            <RadioButton
+                android:id="@+id/radioBase"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Fast: Whisper base (about 150 MB). Use this if captions lag." />
+        </RadioGroup>
+
         <Button
             android:id="@+id/btnOverlay"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
+            android:layout_marginTop="12dp"
             android:text="1. Allow display over other apps" />
 
         <Button
@@ -44,7 +64,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="2. Download models (about 80 MB, once)" />
+            android:text="2. Download selected model" />
 
         <Button
             android:id="@+id/btnStart"
@@ -64,7 +84,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="20dp"
-            android:text="Tips:\n• When Android asks to share your screen, choose “Entire screen”. The app only listens to audio; it does not record your screen.\n• After START, open your video app or browser. Captions float at the bottom; drag them to move, tap ✕ Stop to end.\n• Some apps (Netflix, some streaming apps) block audio capture and will give no captions."
+            android:text="Tips:\n• When Android asks to share your screen, choose “Entire screen”. The app only listens to audio; it does not record your screen.\n• After START, open your video app or browser. Captions appear a few seconds after each sentence. Drag the box to move it, tap ✕ Stop to end.\n• Some apps (Netflix, some streaming apps) block audio capture and will give no captions."
             android:textSize="13sp" />
     </LinearLayout>
 </ScrollView>
