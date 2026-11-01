@@ -86,11 +86,21 @@ class MainActivity : AppCompatActivity() {
         // Remove the old speech model from the previous app version (frees space).
         Thread { File(filesDir, "model-ja").deleteRecursively() }.start()
 
+        val radioReazon = findViewById<RadioButton>(R.id.radioReazon)
         val radioSmall = findViewById<RadioButton>(R.id.radioSmall)
         val radioBase = findViewById<RadioButton>(R.id.radioBase)
-        if (sel() == "base") radioBase.isChecked = true else radioSmall.isChecked = true
+        when (sel()) {
+            "base" -> radioBase.isChecked = true
+            "small" -> radioSmall.isChecked = true
+            else -> radioReazon.isChecked = true
+        }
         findViewById<RadioGroup>(R.id.modelGroup).setOnCheckedChangeListener { _, id ->
-            prefs.edit().putString("sel", if (id == R.id.radioBase) "base" else "small").apply()
+            val v = when (id) {
+                R.id.radioBase -> "base"
+                R.id.radioSmall -> "small"
+                else -> "reazon"
+            }
+            prefs.edit().putString("sel3", v).apply()
             refresh()
         }
 
@@ -109,13 +119,25 @@ class MainActivity : AppCompatActivity() {
         refresh()
     }
 
-    private fun sel(): String = prefs.getString("sel", "small") ?: "small"
+    private fun sel(): String = prefs.getString("sel3", "reazon") ?: "reazon"
 
     private fun itemsFor(s: String): List<Item> {
+        val vad = Item(VAD_URL, File(filesDir, "silero_vad.onnx"), "voice detector")
+        if (s == "reazon") {
+            val dir = File(filesDir, "asr-reazon")
+            val base = "https://huggingface.co/reazon-research/reazonspeech-k2-v2/resolve/main"
+            return listOf(
+                vad,
+                Item("$base/tokens.txt", File(dir, "tokens.txt"), "vocabulary"),
+                Item("$base/encoder-epoch-99-avg-1.int8.onnx", File(dir, "encoder.int8.onnx"), "Japanese model part 1"),
+                Item("$base/decoder-epoch-99-avg-1.onnx", File(dir, "decoder.onnx"), "Japanese model part 2"),
+                Item("$base/joiner-epoch-99-avg-1.int8.onnx", File(dir, "joiner.int8.onnx"), "Japanese model part 3")
+            )
+        }
         val dir = File(filesDir, "whisper-$s")
         val base = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-$s/resolve/main/$s"
         return listOf(
-            Item(VAD_URL, File(filesDir, "silero_vad.onnx"), "voice detector"),
+            vad,
             Item("$base-tokens.txt", File(dir, "tokens.txt"), "vocabulary"),
             Item("$base-encoder.int8.onnx", File(dir, "encoder.int8.onnx"), "Whisper part 1"),
             Item("$base-decoder.int8.onnx", File(dir, "decoder.int8.onnx"), "Whisper part 2")
@@ -141,7 +163,7 @@ class MainActivity : AppCompatActivity() {
             status.text = when {
                 !overlayOk -> "Step 1: allow display over other apps."
                 !modelsOk -> "Step 2: download the selected model (needs internet, once)."
-                else -> "Ready (Whisper $s). Tap START, then open your video."
+                else -> "Ready ($s model). Tap START, then open your video."
             }
         }
     }
