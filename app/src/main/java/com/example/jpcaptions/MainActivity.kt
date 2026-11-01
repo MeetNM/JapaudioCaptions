@@ -9,6 +9,8 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Button
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -19,16 +21,18 @@ import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslatorOptions
 import java.io.File
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.zip.ZipInputStream
 
 class MainActivity : AppCompatActivity() {
 
     companion object {
-        const val MODEL_URL =
-            "https://alphacephei.com/vosk/models/vosk-model-small-ja-0.22.zip"
+        const val VAD_URL =
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
     }
+
+    private class Item(val url: String, val dest: File, val label: String)
 
     private lateinit var status: TextView
     private lateinit var btnOverlay: Button
@@ -53,7 +57,7 @@ class MainActivity : AppCompatActivity() {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                 == PackageManager.PERMISSION_GRANTED
             ) askProjection()
-            else toast("Microphone/audio permission is required to capture audio.")
+            else toast("Audio permission is required to capture audio.")
         }
 
     private val projectionLauncher =
@@ -79,6 +83,17 @@ class MainActivity : AppCompatActivity() {
         btnStart = findViewById(R.id.btnStart)
         btnStop = findViewById(R.id.btnStop)
 
+        // Remove the old speech model from the previous app version (frees space).
+        Thread { File(filesDir, "model-ja").deleteRecursively() }.start()
+
+        val radioSmall = findViewById<RadioButton>(R.id.radioSmall)
+        val radioBase = findViewById<RadioButton>(R.id.radioBase)
+        if (sel() == "base") radioBase.isChecked = true else radioSmall.isChecked = true
+        findViewById<RadioGroup>(R.id.modelGroup).setOnCheckedChangeListener { _, id ->
+            prefs.edit().putString("sel", if (id == R.id.radioBase) "base" else "small").apply()
+            refresh()
+        }
+
         btnOverlay.setOnClickListener {
             startActivity(
                 Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
@@ -94,24 +109,39 @@ class MainActivity : AppCompatActivity() {
         refresh()
     }
 
-    private fun modelsReady() =
-        prefs.getBoolean("ready", false) && File(filesDir, "model-ja/am").exists()
+    private fun sel(): String = prefs.getString("sel", "small") ?: "small"
+
+    private fun itemsFor(s: String): List<Item> {
+        val dir = File(filesDir, "whisper-$s")
+        val base = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-$s/resolve/main/$s"
+        return listOf(
+            Item(VAD_URL, File(filesDir, "silero_vad.onnx"), "voice detector"),
+            Item("$base-tokens.txt", File(dir, "tokens.txt"), "vocabulary"),
+            Item("$base-encoder.int8.onnx", File(dir, "encoder.int8.onnx"), "Whisper part 1"),
+            Item("$base-decoder.int8.onnx", File(dir, "decoder.int8.onnx"), "Whisper part 2")
+        )
+    }
+
+    private fun modelsReady(s: String): Boolean =
+        prefs.getBoolean("mt_ready", false) &&
+            itemsFor(s).all { it.dest.exists() && it.dest.length() > 0 }
 
     private fun refresh() {
+        val s = sel()
         val overlayOk = Settings.canDrawOverlays(this)
-        val modelsOk = modelsReady()
+        val modelsOk = modelsReady(s)
         btnOverlay.text =
             if (overlayOk) "1. Display over other apps ✓" else "1. Allow display over other apps"
         btnOverlay.isEnabled = !overlayOk
         btnModels.text =
-            if (modelsOk) "2. Models downloaded ✓" else "2. Download models (about 80 MB, once)"
+            if (modelsOk) "2. Selected model downloaded ✓" else "2. Download selected model"
         btnModels.isEnabled = !modelsOk && !downloading
         btnStart.isEnabled = overlayOk && modelsOk
         if (!downloading) {
             status.text = when {
                 !overlayOk -> "Step 1: allow display over other apps."
-                !modelsOk -> "Step 2: download the models (needs internet, once)."
-                else -> "Ready. Tap START, then open your video."
+                !modelsOk -> "Step 2: download the selected model (needs internet, once)."
+                else -> "Ready (Whisper $s). Tap START, then open your video."
             }
         }
     }
@@ -132,17 +162,18 @@ class MainActivity : AppCompatActivity() {
 
     // ---------- model download ----------
     private fun downloadModels() {
+        val s = sel()
         downloading = true
         refresh()
         Thread {
             try {
-                val target = File(filesDir, "model-ja")
-                if (!File(target, "am").exists()) downloadSpeechModel(target)
+                val items = itemsFor(s)
+                for ((i, item) in items.withIndex()) downloadFile(item, i + 1, items.size)
                 runOnUiThread {
                     setStatus("Downloading translation model…")
                     translator.downloadModelIfNeeded(DownloadConditions.Builder().build())
                         .addOnSuccessListener {
-                            prefs.edit().putBoolean("ready", true).apply()
+                            prefs.edit().putBoolean("mt_ready", true).apply()
                             downloading = false
                             refresh()
                         }
@@ -156,21 +187,27 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     downloading = false
                     refresh()
-                    setStatus("Download failed: ${e.message}. Check internet and retry.")
+                    setStatus("Download failed: ${e.message}. Check internet and tap download again.")
                 }
             }
         }.start()
     }
 
-    private fun downloadSpeechModel(target: File) {
-        val conn = URL(MODEL_URL).openConnection() as HttpURLConnection
+    private fun downloadFile(item: Item, step: Int, steps: Int) {
+        if (item.dest.exists() && item.dest.length() > 0) return
+        item.dest.parentFile?.mkdirs()
+        val part = File(item.dest.path + ".part")
+        val conn = URL(item.url).openConnection() as HttpURLConnection
         conn.connectTimeout = 20000
         conn.readTimeout = 30000
+        conn.setRequestProperty("User-Agent", "JPCaptions/3.0")
+        if (conn.responseCode != 200) {
+            throw IOException("server answered ${conn.responseCode} for ${item.label}")
+        }
         val total = conn.contentLengthLong
-        val zipFile = File(cacheDir, "model.zip")
         var lastPct = -1
         conn.inputStream.use { input ->
-            zipFile.outputStream().use { out ->
+            part.outputStream().use { out ->
                 val buf = ByteArray(64 * 1024)
                 var done = 0L
                 while (true) {
@@ -182,35 +219,15 @@ class MainActivity : AppCompatActivity() {
                         val pct = (done * 100 / total).toInt()
                         if (pct != lastPct) {
                             lastPct = pct
-                            runOnUiThread { setStatus("Downloading Japanese speech model… $pct%") }
+                            runOnUiThread {
+                                setStatus("Downloading ${item.label} ($step of $steps)… $pct%")
+                            }
                         }
                     }
                 }
             }
         }
-        runOnUiThread { setStatus("Unpacking speech model…") }
-        target.deleteRecursively()
-        target.mkdirs()
-        val base = target.canonicalPath + File.separator
-        ZipInputStream(zipFile.inputStream().buffered()).use { zis ->
-            var e = zis.nextEntry
-            while (e != null) {
-                val name = e.name.substringAfter('/', "")
-                if (name.isNotEmpty()) {
-                    val out = File(target, name)
-                    if (!out.canonicalPath.startsWith(base)) throw SecurityException("Bad zip entry")
-                    if (e.isDirectory) {
-                        out.mkdirs()
-                    } else {
-                        out.parentFile?.mkdirs()
-                        out.outputStream().use { zis.copyTo(it) }
-                    }
-                }
-                zis.closeEntry()
-                e = zis.nextEntry
-            }
-        }
-        zipFile.delete()
+        if (!part.renameTo(item.dest)) throw IOException("could not save ${item.label}")
     }
 
     override fun onDestroy() {
