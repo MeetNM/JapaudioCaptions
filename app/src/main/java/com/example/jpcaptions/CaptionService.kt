@@ -1,5 +1,6 @@
 package com.example.jpcaptions
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
@@ -7,6 +8,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -18,6 +20,7 @@ import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -237,13 +240,36 @@ class CaptionService : Service() {
     private fun ui(block: () -> Unit) { main.post { block() } }
 
     // ---------- audio -> speech detection -> Whisper -> English ----------
+    private class Cap(val record: AudioRecord, val rate: Int, val channels: Int)
+
     private fun runPipeline() {
         var vad: Vad? = null
         var rec: OfflineRecognizer? = null
-        var record: AudioRecord? = null
+        var cap: Cap? = null
         var decodeThread: Thread? = null
         val queue = LinkedBlockingQueue<FloatArray>()
         try {
+            // 1) Start capturing system audio FIRST, while the screen-share permission is fresh.
+            val errors = StringBuilder()
+            val c = buildRecord(errors)
+            if (c == null) {
+                val mic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                    PackageManager.PERMISSION_GRANTED
+                showError(
+                    "Could not capture system audio.\n$errors\n" +
+                        "Android ${Build.VERSION.RELEASE}, ${Build.MANUFACTURER} ${Build.MODEL}, " +
+                        "audio permission: $mic"
+                )
+                return
+            }
+            cap = c
+            c.record.startRecording()
+            if (c.record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                showError("System audio capture did not start (${c.rate} Hz, ${c.channels} ch).")
+                return
+            }
+
+            // 2) Load translation + Whisper + voice detector (takes a few seconds).
             translator = Translation.getClient(
                 TranslatorOptions.Builder()
                     .setSourceLanguage(TranslateLanguage.JAPANESE)
@@ -295,23 +321,19 @@ class CaptionService : Service() {
             vad = v
 
             decodeThread = Thread { decodeLoop(r, queue) }.also { it.start() }
-
-            val ar = buildRecord()
-            if (ar == null) {
-                showError("Could not capture system audio on this phone.")
-                return
-            }
-            record = ar
-            ar.startRecording()
             ui { jpText?.text = ""; enText?.text = "Listening to system audio…" }
 
-            val buf = ByteArray(3200) // ~100 ms
+            val buf = ByteArray(c.rate * c.channels * 2 / 10) // ~100 ms
+            val resampler = Resampler(c.rate, SAMPLE_RATE)
             var speaking = false
             while (running) {
-                val n = ar.read(buf, 0, buf.size)
+                val n = c.record.read(buf, 0, buf.size)
                 if (n < 0) break
                 if (n == 0) continue
-                v.acceptWaveform(pcmToFloat(buf, n))
+                val samples = resampler.process(toMono(buf, n, c.channels))
+                if (samples.isEmpty()) continue
+                agc(samples)
+                v.acceptWaveform(samples)
 
                 val sp = v.isSpeechDetected()
                 if (sp && !speaking) {
@@ -331,8 +353,8 @@ class CaptionService : Service() {
             queue.clear()
             queue.offer(STOP)
             try { decodeThread?.join() } catch (_: InterruptedException) {}
-            try { record?.stop() } catch (_: Exception) {}
-            record?.release()
+            try { cap?.record?.stop() } catch (_: Exception) {}
+            cap?.record?.release()
             vad?.release()
             rec?.release()
         }
@@ -364,49 +386,77 @@ class CaptionService : Service() {
         }
     }
 
+    // Tries several audio formats, because phones differ in what system-audio capture allows.
     @SuppressLint("MissingPermission")
-    private fun buildRecord(): AudioRecord? {
-        val proj = projection ?: return null
+    private fun buildRecord(errors: StringBuilder): Cap? {
+        val proj = projection
+        if (proj == null) {
+            errors.append("no screen-share permission; ")
+            return null
+        }
         val cfg = AudioPlaybackCaptureConfiguration.Builder(proj)
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
             .addMatchingUsage(AudioAttributes.USAGE_GAME)
             .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
             .build()
-        val fmt = AudioFormat.Builder()
-            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-            .setSampleRate(SAMPLE_RATE)
-            .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-            .build()
-        val minBuf = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
-        )
-        val ar = AudioRecord.Builder()
-            .setAudioFormat(fmt)
-            .setBufferSizeInBytes(maxOf(minBuf, 32000))
-            .setAudioPlaybackCaptureConfig(cfg)
-            .build()
-        return if (ar.state == AudioRecord.STATE_INITIALIZED) ar else { ar.release(); null }
+        val tries = listOf(16000 to 1, 48000 to 1, 44100 to 1, 48000 to 2, 44100 to 2, 16000 to 2)
+        for ((rate, ch) in tries) {
+            try {
+                val mask = if (ch == 1) AudioFormat.CHANNEL_IN_MONO else AudioFormat.CHANNEL_IN_STEREO
+                val fmt = AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(rate)
+                    .setChannelMask(mask)
+                    .build()
+                val minBuf = AudioRecord.getMinBufferSize(rate, mask, AudioFormat.ENCODING_PCM_16BIT)
+                if (minBuf <= 0) {
+                    errors.append("$rate Hz/$ch ch: unsupported; ")
+                    continue
+                }
+                val ar = AudioRecord.Builder()
+                    .setAudioFormat(fmt)
+                    .setBufferSizeInBytes(maxOf(minBuf, rate * ch * 2))
+                    .setAudioPlaybackCaptureConfig(cfg)
+                    .build()
+                if (ar.state == AudioRecord.STATE_INITIALIZED) return Cap(ar, rate, ch)
+                ar.release()
+                errors.append("$rate Hz/$ch ch: not initialized; ")
+            } catch (e: Exception) {
+                errors.append("$rate Hz/$ch ch: ${e.javaClass.simpleName} ${e.message}; ")
+            }
+        }
+        return null
     }
 
-    // Converts 16-bit audio to floats and boosts quiet speech (whispers); near-silence is not boosted.
-    private fun pcmToFloat(buf: ByteArray, n: Int): FloatArray {
-        val count = n / 2
-        val out = FloatArray(count)
-        var peak = 1
-        for (i in 0 until count) {
-            val s = ((buf[2 * i + 1].toInt() shl 8) or (buf[2 * i].toInt() and 0xFF)).toShort().toInt()
-            out[i] = s.toFloat()
-            val a = if (s < 0) -s else s
+    // Converts 16-bit audio to mono floats (values in the 16-bit range).
+    private fun toMono(buf: ByteArray, n: Int, ch: Int): FloatArray {
+        val frames = n / (2 * ch)
+        val out = FloatArray(frames)
+        for (f in 0 until frames) {
+            var sum = 0
+            for (c in 0 until ch) {
+                val i = (f * ch + c) * 2
+                sum += ((buf[i + 1].toInt() shl 8) or (buf[i].toInt() and 0xFF)).toShort().toInt()
+            }
+            out[f] = sum.toFloat() / ch
+        }
+        return out
+    }
+
+    // Boosts quiet speech (whispers); near-silence is not boosted. Output is scaled to -1..1.
+    private fun agc(x: FloatArray) {
+        var peak = 1f
+        for (v in x) {
+            val a = if (v < 0f) -v else v
             if (a > peak) peak = a
         }
-        if (peak >= 250) {
+        if (peak >= 250f) {
             val target = (20000f / peak).coerceIn(1f, 8f)
             agcGain = if (target < agcGain) target else agcGain + (target - agcGain) * 0.05f
         }
-        for (i in 0 until count) {
-            out[i] = (out[i] * agcGain).coerceIn(-32768f, 32767f) / 32768f
+        for (i in x.indices) {
+            x[i] = (x[i] * agcGain).coerceIn(-32768f, 32767f) / 32768f
         }
-        return out
     }
 
     private fun onFinal(t: String) {
@@ -444,5 +494,31 @@ class CaptionService : Service() {
         overlay = null
         translator?.close()
         super.onDestroy()
+    }
+}
+
+// Simple streaming resampler (e.g. 48000 Hz -> 16000 Hz) using linear interpolation.
+private class Resampler(private val inRate: Int, private val outRate: Int) {
+    private val step = inRate.toDouble() / outRate
+    private var pos = 0.0
+    private var prev = 0f
+
+    fun process(x: FloatArray): FloatArray {
+        if (inRate == outRate) return x
+        val n = x.size
+        if (n == 0) return x
+        val out = FloatArray((n / step).toInt() + 3)
+        var k = 0
+        while (pos < n - 1) {
+            val i = Math.floor(pos).toInt()
+            val frac = (pos - i).toFloat()
+            val a = if (i < 0) prev else x[i]
+            val b = x[i + 1]
+            out[k++] = a + (b - a) * frac
+            pos += step
+        }
+        pos -= n
+        prev = x[n - 1]
+        return out.copyOf(k)
     }
 }
