@@ -21,7 +21,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="Captions the audio playing on your phone (any app or browser) using Whisper AI and shows English subtitles on top of other apps."
+            android:text="Captions the audio playing on your phone (any app or browser) using on-device AI and shows English subtitles on top of other apps."
             android:textSize="14sp" />
 
         <TextView
@@ -40,16 +40,22 @@
             android:orientation="vertical">
 
             <RadioButton
+                android:id="@+id/radioReazon"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Recommended: Japanese model, fast and accurate (about 170 MB). Shows captions while people are still talking." />
+
+            <RadioButton
                 android:id="@+id/radioSmall"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Accurate: Whisper small (about 375 MB). Best for quiet speech." />
+                android:text="Whisper small (about 375 MB). Slower, handles noisy audio." />
 
             <RadioButton
                 android:id="@+id/radioBase"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Fast: Whisper base (about 150 MB). Use this if captions lag." />
+                android:text="Whisper base (about 150 MB). Faster than small, less accurate." />
         </RadioGroup>
 
         <Button
