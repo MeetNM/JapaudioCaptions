@@ -24,6 +24,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -39,6 +40,7 @@ import com.k2fsa.sherpa.onnx.FeatureConfig
 import com.k2fsa.sherpa.onnx.OfflineModelConfig
 import com.k2fsa.sherpa.onnx.OfflineRecognizer
 import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
+import com.k2fsa.sherpa.onnx.OfflineTransducerModelConfig
 import com.k2fsa.sherpa.onnx.OfflineWhisperModelConfig
 import com.k2fsa.sherpa.onnx.SileroVadModelConfig
 import com.k2fsa.sherpa.onnx.Vad
@@ -52,7 +54,7 @@ class CaptionService : Service() {
         const val ACTION_STOP = "com.example.jpcaptions.STOP"
         private const val CHANNEL_ID = "captions"
         private const val SAMPLE_RATE = 16000
-        private val STOP = FloatArray(0)
+        private val STOP_JOB = Job(FloatArray(0), true, -1)
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -66,6 +68,8 @@ class CaptionService : Service() {
     private var worker: Thread? = null
 
     @Volatile private var seq = 0
+    @Volatile private var decoding = false
+    @Volatile private var finalizedId = -1
     private var agcGain = 1f
 
     private val clearRunnable = Runnable {
@@ -153,7 +157,7 @@ class CaptionService : Service() {
         }
         val jp = TextView(this).apply {
             setTextColor(0xFFBBBBBB.toInt())
-            text = "Loading Whisper model…"
+            text = "Loading speech model…"
         }
         val en = TextView(this).apply {
             setTextColor(Color.WHITE)
@@ -239,7 +243,7 @@ class CaptionService : Service() {
 
     private fun ui(block: () -> Unit) { main.post { block() } }
 
-    // ---------- audio -> speech detection -> Whisper -> English ----------
+    // ---------- audio -> speech detection -> speech recognition -> English ----------
     private class Cap(val record: AudioRecord, val rate: Int, val channels: Int)
 
     private fun runPipeline() {
@@ -247,7 +251,7 @@ class CaptionService : Service() {
         var rec: OfflineRecognizer? = null
         var cap: Cap? = null
         var decodeThread: Thread? = null
-        val queue = LinkedBlockingQueue<FloatArray>()
+        val queue = LinkedBlockingQueue<Job>()
         try {
             // 1) Start capturing system audio FIRST, while the screen-share permission is fresh.
             val errors = StringBuilder()
@@ -269,7 +273,7 @@ class CaptionService : Service() {
                 return
             }
 
-            // 2) Load translation + Whisper + voice detector (takes a few seconds).
+            // 2) Load translation + speech model + voice detector (takes a few seconds).
             translator = Translation.getClient(
                 TranslatorOptions.Builder()
                     .setSourceLanguage(TranslateLanguage.JAPANESE)
@@ -277,23 +281,39 @@ class CaptionService : Service() {
                     .build()
             )
 
-            val sel = getSharedPreferences("jp", MODE_PRIVATE).getString("sel", "small") ?: "small"
-            val dir = File(filesDir, "whisper-$sel")
-            val whisper = OfflineWhisperModelConfig(
-                encoder = File(dir, "encoder.int8.onnx").absolutePath,
-                decoder = File(dir, "decoder.int8.onnx").absolutePath,
-                language = "ja",
-                task = "transcribe",
-                tailPaddings = 1000
-            )
-            val modelCfg = OfflineModelConfig(
-                whisper = whisper,
-                tokens = File(dir, "tokens.txt").absolutePath,
-                numThreads = 4,
-                debug = false,
-                provider = "cpu",
-                modelType = "whisper"
-            )
+            val sel = getSharedPreferences("jp", MODE_PRIVATE).getString("sel3", "reazon") ?: "reazon"
+            val isReazon = sel == "reazon"
+            val dir = File(filesDir, if (isReazon) "asr-reazon" else "whisper-$sel")
+            val tokens = File(dir, "tokens.txt").absolutePath
+            val modelCfg = if (isReazon) {
+                OfflineModelConfig(
+                    transducer = OfflineTransducerModelConfig(
+                        encoder = File(dir, "encoder.int8.onnx").absolutePath,
+                        decoder = File(dir, "decoder.onnx").absolutePath,
+                        joiner = File(dir, "joiner.int8.onnx").absolutePath
+                    ),
+                    tokens = tokens,
+                    numThreads = 4,
+                    debug = false,
+                    provider = "cpu",
+                    modelType = "transducer"
+                )
+            } else {
+                OfflineModelConfig(
+                    whisper = OfflineWhisperModelConfig(
+                        encoder = File(dir, "encoder.int8.onnx").absolutePath,
+                        decoder = File(dir, "decoder.int8.onnx").absolutePath,
+                        language = "ja",
+                        task = "transcribe",
+                        tailPaddings = 1000
+                    ),
+                    tokens = tokens,
+                    numThreads = 4,
+                    debug = false,
+                    provider = "cpu",
+                    modelType = "whisper"
+                )
+            }
             val recCfg = OfflineRecognizerConfig(
                 featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = 80),
                 modelConfig = modelCfg,
@@ -302,15 +322,16 @@ class CaptionService : Service() {
             val r = OfflineRecognizer(null, recCfg)
             rec = r
 
-            // Sensitive settings so quiet speech and whispers are still picked up.
+            // Sensitive settings so quiet speech is still picked up. Shorter pauses and chunks
+            // with the fast Japanese model make captions appear sooner.
             val vadCfg = VadModelConfig(
                 sileroVadModelConfig = SileroVadModelConfig(
                     model = File(filesDir, "silero_vad.onnx").absolutePath,
                     threshold = 0.35f,
-                    minSilenceDuration = 0.45f,
+                    minSilenceDuration = if (isReazon) 0.3f else 0.45f,
                     minSpeechDuration = 0.2f,
                     windowSize = 512,
-                    maxSpeechDuration = 8f
+                    maxSpeechDuration = if (isReazon) 6f else 8f
                 ),
                 sampleRate = SAMPLE_RATE,
                 numThreads = 1,
@@ -320,12 +341,20 @@ class CaptionService : Service() {
             val v = Vad(null, vadCfg)
             vad = v
 
+            finalizedId = -1
             decodeThread = Thread { decodeLoop(r, queue) }.also { it.start() }
             ui { jpText?.text = ""; enText?.text = "Listening to system audio…" }
 
             val buf = ByteArray(c.rate * c.channels * 2 / 10) // ~100 ms
             val resampler = Resampler(c.rate, SAMPLE_RATE)
             var speaking = false
+
+            // Live interim captions while someone is still talking (fast model only).
+            val speechBuf = FloatArray(SAMPLE_RATE * 8)
+            var bufLen = 0
+            var lastInterimAt = 0L
+            var segId = 0
+
             while (running) {
                 val n = c.record.read(buf, 0, buf.size)
                 if (n < 0) break
@@ -341,17 +370,36 @@ class CaptionService : Service() {
                 }
                 speaking = sp
 
+                if (isReazon && sp) {
+                    if (bufLen + samples.size > speechBuf.size) {
+                        val drop = bufLen + samples.size - speechBuf.size
+                        System.arraycopy(speechBuf, drop, speechBuf, 0, bufLen - drop)
+                        bufLen -= drop
+                    }
+                    System.arraycopy(samples, 0, speechBuf, bufLen, samples.size)
+                    bufLen += samples.size
+                    val now = SystemClock.uptimeMillis()
+                    if (now - lastInterimAt >= 700 && bufLen >= SAMPLE_RATE / 2 &&
+                        !decoding && queue.isEmpty()
+                    ) {
+                        lastInterimAt = now
+                        queue.offer(Job(speechBuf.copyOf(bufLen), false, segId))
+                    }
+                }
+
                 while (!v.empty()) {
                     val seg = v.front()
                     v.pop()
-                    queue.offer(seg.samples)
+                    queue.offer(Job(seg.samples, true, segId))
+                    segId++
+                    bufLen = 0
                 }
             }
         } catch (e: Throwable) {
             showError("Error: ${e.message}")
         } finally {
             queue.clear()
-            queue.offer(STOP)
+            queue.offer(STOP_JOB)
             try { decodeThread?.join() } catch (_: InterruptedException) {}
             try { cap?.record?.stop() } catch (_: Exception) {}
             cap?.record?.release()
@@ -360,25 +408,38 @@ class CaptionService : Service() {
         }
     }
 
-    // Runs Whisper on finished speech segments. If the phone falls behind, old segments are skipped.
-    private fun decodeLoop(r: OfflineRecognizer, queue: LinkedBlockingQueue<FloatArray>) {
+    // Runs speech recognition on audio jobs. Interim jobs are skipped when newer audio is waiting;
+    // if the phone falls behind on finished sentences, older ones are skipped.
+    private fun decodeLoop(r: OfflineRecognizer, queue: LinkedBlockingQueue<Job>) {
         try {
             while (true) {
-                var seg = queue.take()
-                if (seg === STOP) return
-                while (queue.size > 2) {
-                    val next = queue.poll() ?: break
-                    if (next === STOP) return
-                    seg = next
+                var job = queue.take()
+                if (job === STOP_JOB) return
+                if (!job.final) {
+                    if (queue.isNotEmpty() || job.id <= finalizedId) continue
+                } else {
+                    while (queue.size > 2) {
+                        val next = queue.poll() ?: break
+                        if (next === STOP_JOB) return
+                        if (next.final) job = next
+                    }
                 }
-                val stream = r.createStream()
+                decoding = true
                 try {
-                    stream.acceptWaveform(seg, SAMPLE_RATE)
-                    r.decode(stream)
-                    val text = r.getResult(stream).text.trim()
-                    if (text.any { it.isLetterOrDigit() }) onFinal(text)
+                    val stream = r.createStream()
+                    try {
+                        stream.acceptWaveform(job.samples, SAMPLE_RATE)
+                        r.decode(stream)
+                        val text = r.getResult(stream).text.trim()
+                        if (job.final) finalizedId = job.id
+                        if (text.any { it.isLetterOrDigit() }) {
+                            if (job.final || job.id > finalizedId) onFinal(text)
+                        }
+                    } finally {
+                        stream.release()
+                    }
                 } finally {
-                    stream.release()
+                    decoding = false
                 }
             }
         } catch (e: Throwable) {
@@ -522,3 +583,5 @@ private class Resampler(private val inRate: Int, private val outRate: Int) {
         return out.copyOf(k)
     }
 }
+
+private class Job(val samples: FloatArray, val final: Boolean, val id: Int)
