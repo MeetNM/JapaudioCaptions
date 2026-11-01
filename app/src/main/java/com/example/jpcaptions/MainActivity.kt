@@ -3,183 +3,218 @@ package com.example.jpcaptions
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
+import android.provider.Settings
 import android.widget.Button
-import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslatorOptions
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.zip.ZipInputStream
 
 class MainActivity : AppCompatActivity() {
 
-    private val handler = Handler(Looper.getMainLooper())
-    private var recognizer: SpeechRecognizer? = null
-    private var wantListening = false
-    
-    private var partialSeq = 0
-
-    private val translator = Translation.getClient(
-        TranslatorOptions.Builder()
-            .setSourceLanguage(TranslateLanguage.JAPANESE)
-            .setTargetLanguage(TranslateLanguage.ENGLISH)
-            .build()
-    )
+    companion object {
+        const val MODEL_URL =
+            "https://alphacephei.com/vosk/models/vosk-model-small-ja-0.22.zip"
+    }
 
     private lateinit var status: TextView
-    private lateinit var history: TextView
-    private lateinit var live: TextView
-    private lateinit var scroll: ScrollView
-    private lateinit var toggle: Button
+    private lateinit var btnOverlay: Button
+    private lateinit var btnModels: Button
+    private lateinit var btnStart: Button
+    private lateinit var btnStop: Button
+    private var downloading = false
+
+    private val prefs by lazy { getSharedPreferences("jp", MODE_PRIVATE) }
+
+    private val translator by lazy {
+        Translation.getClient(
+            TranslatorOptions.Builder()
+                .setSourceLanguage(TranslateLanguage.JAPANESE)
+                .setTargetLanguage(TranslateLanguage.ENGLISH)
+                .build()
+        )
+    }
+
+    private val permLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED
+            ) askProjection()
+            else toast("Microphone/audio permission is required to capture audio.")
+        }
+
+    private val projectionLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+            val data = r.data
+            if (r.resultCode == RESULT_OK && data != null) {
+                val svc = Intent(this, CaptionService::class.java)
+                    .putExtra("code", r.resultCode)
+                    .putExtra("data", data)
+                ContextCompat.startForegroundService(this, svc)
+                moveTaskToBack(true)
+            } else {
+                toast("Audio capture permission was denied.")
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-
         status = findViewById(R.id.status)
-        history = findViewById(R.id.history)
-        live = findViewById(R.id.live)
-        scroll = findViewById(R.id.scroll)
-        toggle = findViewById(R.id.toggle)
+        btnOverlay = findViewById(R.id.btnOverlay)
+        btnModels = findViewById(R.id.btnModels)
+        btnStart = findViewById(R.id.btnStart)
+        btnStop = findViewById(R.id.btnStop)
 
-        findViewById<Button>(R.id.clear).setOnClickListener {
-            history.text = ""
-            live.text = ""
+        btnOverlay.setOnClickListener {
+            startActivity(
+                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+            )
         }
-        toggle.setOnClickListener { if (wantListening) stopListening() else startListening() }
+        btnModels.setOnClickListener { downloadModels() }
+        btnStart.setOnClickListener { requestPermissionsThenStart() }
+        btnStop.setOnClickListener { stopService(Intent(this, CaptionService::class.java)) }
+    }
 
-        // Download the Japanese->English model once (~30 MB); works offline afterwards.
-        translator.downloadModelIfNeeded(DownloadConditions.Builder().build())
-            .addOnSuccessListener {
-                status.text = "Ready. Tap START."
-                toggle.isEnabled = true
+    override fun onResume() {
+        super.onResume()
+        refresh()
+    }
+
+    private fun modelsReady() =
+        prefs.getBoolean("ready", false) && File(filesDir, "model-ja/am").exists()
+
+    private fun refresh() {
+        val overlayOk = Settings.canDrawOverlays(this)
+        val modelsOk = modelsReady()
+        btnOverlay.text =
+            if (overlayOk) "1. Display over other apps ✓" else "1. Allow display over other apps"
+        btnOverlay.isEnabled = !overlayOk
+        btnModels.text =
+            if (modelsOk) "2. Models downloaded ✓" else "2. Download models (about 80 MB, once)"
+        btnModels.isEnabled = !modelsOk && !downloading
+        btnStart.isEnabled = overlayOk && modelsOk
+        if (!downloading) {
+            status.text = when {
+                !overlayOk -> "Step 1: allow display over other apps."
+                !modelsOk -> "Step 2: download the models (needs internet, once)."
+                else -> "Ready. Tap START, then open your video."
             }
-            .addOnFailureListener {
-                status.text = "Model download failed. Connect to the internet and reopen the app."
-            }
-    }
-
-    private fun startListening() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 1)
-            return
         }
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            Toast.makeText(
-                this,
-                "No speech recognition service found. Install/enable the Google app.",
-                Toast.LENGTH_LONG
-            ).show()
-            return
-        }
-        wantListening = true
-        toggle.text = "STOP"
-        status.text = "Listening for Japanese…"
-        live.text = "…"
-        beginRecognizer()
     }
 
-    private fun stopListening() {
-        wantListening = false
-        handler.removeCallbacksAndMessages(null)
-        recognizer?.destroy()
-        recognizer = null
-        toggle.text = "START"
-        status.text = "Stopped."
+    private fun setStatus(s: String) { status.text = s }
+    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
+
+    private fun requestPermissionsThenStart() {
+        val need = mutableListOf(Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT >= 33) need += Manifest.permission.POST_NOTIFICATIONS
+        permLauncher.launch(need.toTypedArray())
     }
 
-    override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
-        super.onRequestPermissionsResult(code, perms, results)
-        if (code == 1 && results.firstOrNull() == PackageManager.PERMISSION_GRANTED) startListening()
-        else Toast.makeText(this, "Microphone permission is required.", Toast.LENGTH_LONG).show()
+    private fun askProjection() {
+        val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        projectionLauncher.launch(mpm.createScreenCaptureIntent())
     }
 
-    private fun beginRecognizer() {
-        if (!wantListening) return
-        recognizer?.destroy()
-        recognizer = SpeechRecognizer.createSpeechRecognizer(this).also {
-            it.setRecognitionListener(listener)
-        }
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ja-JP")
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "ja-JP")
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-        }
-        recognizer?.startListening(intent)
-    }
-
-    private fun restartSoon(delayMs: Long) {
-        if (!wantListening) return
-        handler.postDelayed({ beginRecognizer() }, delayMs)
-    }
-
-    private fun translate(text: String, done: (String) -> Unit) {
-        translator.translate(text)
-            .addOnSuccessListener { done(it) }
-            .addOnFailureListener { done("[translation failed]") }
-    }
-
-    private val listener = object : RecognitionListener {
-        override fun onPartialResults(partial: Bundle?) {
-            val text = partial?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                ?.firstOrNull().orEmpty()
-            if (text.isBlank()) return
-            val seq = ++partialSeq
-            translate(text) { en -> if (seq == partialSeq) live.text = en }
-        }
-
-        override fun onResults(results: Bundle?) {
-            val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                ?.firstOrNull().orEmpty()
-            if (text.isNotBlank()) {
-                partialSeq++
-                translate(text) { en ->
-                    live.text = en
-                    history.append("$text\n$en\n\n")
-                    scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
+    // ---------- model download ----------
+    private fun downloadModels() {
+        downloading = true
+        refresh()
+        Thread {
+            try {
+                val target = File(filesDir, "model-ja")
+                if (!File(target, "am").exists()) downloadSpeechModel(target)
+                runOnUiThread {
+                    setStatus("Downloading translation model…")
+                    translator.downloadModelIfNeeded(DownloadConditions.Builder().build())
+                        .addOnSuccessListener {
+                            prefs.edit().putBoolean("ready", true).apply()
+                            downloading = false
+                            refresh()
+                        }
+                        .addOnFailureListener {
+                            downloading = false
+                            refresh()
+                            setStatus("Translation model download failed. Check internet and retry.")
+                        }
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    downloading = false
+                    refresh()
+                    setStatus("Download failed: ${e.message}. Check internet and retry.")
                 }
             }
-            restartSoon(200)
-        }
+        }.start()
+    }
 
-        override fun onError(error: Int) {
-            when (error) {
-                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
-                    stopListening()
-                    status.text = "Microphone permission denied."
+    private fun downloadSpeechModel(target: File) {
+        val conn = URL(MODEL_URL).openConnection() as HttpURLConnection
+        conn.connectTimeout = 20000
+        conn.readTimeout = 30000
+        val total = conn.contentLengthLong
+        val zipFile = File(cacheDir, "model.zip")
+        var lastPct = -1
+        conn.inputStream.use { input ->
+            zipFile.outputStream().use { out ->
+                val buf = ByteArray(64 * 1024)
+                var done = 0L
+                while (true) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                    done += n
+                    if (total > 0) {
+                        val pct = (done * 100 / total).toInt()
+                        if (pct != lastPct) {
+                            lastPct = pct
+                            runOnUiThread { setStatus("Downloading Japanese speech model… $pct%") }
+                        }
+                    }
                 }
-                SpeechRecognizer.ERROR_NO_MATCH,
-                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> restartSoon(200)
-                else -> restartSoon(900)
             }
         }
-
-        override fun onReadyForSpeech(params: Bundle?) {}
-        override fun onBeginningOfSpeech() {}
-        override fun onRmsChanged(rmsdB: Float) {}
-        override fun onBufferReceived(buffer: ByteArray?) {}
-        override fun onEndOfSpeech() {}
-        override fun onEvent(eventType: Int, params: Bundle?) {}
+        runOnUiThread { setStatus("Unpacking speech model…") }
+        target.deleteRecursively()
+        target.mkdirs()
+        val base = target.canonicalPath + File.separator
+        ZipInputStream(zipFile.inputStream().buffered()).use { zis ->
+            var e = zis.nextEntry
+            while (e != null) {
+                val name = e.name.substringAfter('/', "")
+                if (name.isNotEmpty()) {
+                    val out = File(target, name)
+                    if (!out.canonicalPath.startsWith(base)) throw SecurityException("Bad zip entry")
+                    if (e.isDirectory) {
+                        out.mkdirs()
+                    } else {
+                        out.parentFile?.mkdirs()
+                        out.outputStream().use { zis.copyTo(it) }
+                    }
+                }
+                zis.closeEntry()
+                e = zis.nextEntry
+            }
+        }
+        zipFile.delete()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        handler.removeCallbacksAndMessages(null)
-        recognizer?.destroy()
         translator.close()
     }
 }
